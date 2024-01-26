@@ -117,10 +117,10 @@ class EMAVectorQuantizer(BaseVectorQuantizer):
         # ema usage count: total count of each embedding trough epochs
         self.register_buffer('ema_count', torch.zeros(num_embeddings))
 
-        # same size as dict, initialized with normal
+        # same size as dict, initialized as codebook
         # the updated means
         self.register_buffer('ema_weight', torch.empty((self.num_embeddings, self.embedding_dim)))
-        self.ema_weight.data.normal_()
+        self.ema_weight.data.uniform_(-1 / self.num_embeddings, 1 / self.num_embeddings)
 
         self.decay = decay
         self.epsilon = epsilon
@@ -215,6 +215,7 @@ class GumbelVectorQuantizer(BaseVectorQuantizer):
         """
         super().__init__(num_embeddings, embedding_dim)
 
+        self.x_to_logits = torch.nn.Conv2d(num_embeddings, num_embeddings, 1)
         self.straight_through = straight_through
         self.temp = temp
         self.kl_cost = kl_cost
@@ -228,11 +229,15 @@ class GumbelVectorQuantizer(BaseVectorQuantizer):
         # deterministic quantization during inference
         hard = self.straight_through if self.training else True
 
-        soft_one_hot = F.gumbel_softmax(x, tau=self.temp, dim=1, hard=hard)
+        logits = self.x_to_logits(x)
+        soft_one_hot = F.gumbel_softmax(logits, tau=self.temp, dim=1, hard=hard)
         quantized = einsum(soft_one_hot, self.get_codebook(), 'b n h w, n d -> b d h w')
 
         # + kl divergence to the prior (uniform) loss, increase cb usage
-        qy = F.softmax(x, dim=1)
+        # Note:
+        #       KL(P(x), Q(x)) = sum_x (P(x) * log(P(x) / Q(x)))
+        #       in this case: P(x) is qy, Q(x) is uniform distribution (1 / num_embeddings)
+        qy = F.softmax(logits, dim=1)
         kl_loss = self.kl_cost * torch.sum(qy * torch.log(qy * self.num_embeddings + 1e-10), dim=1).mean()
 
         encoding_indices = soft_one_hot.argmax(dim=1).detach()

@@ -1,25 +1,16 @@
 import torch
 import pytorch_lightning as pl
-from ffcv.loader import OrderOption
 from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor
 from pytorch_lightning.loggers.wandb import WandbLogger
-
-from ffcv.fields.rgb_image import CenterCropRGBImageDecoder
-from ffcv.transforms import ToTensor, ToTorchImage
-
-from ffcv_pl.data_loading import FFCVDataModule
-from ffcv_pl.ffcv_utils.augmentations import DivideImage255
-from ffcv_pl.ffcv_utils.utils import FFCVPipelineManager
 from pytorch_lightning.strategies import DDPStrategy
 
+from vqvae.common_utils import set_matmul_precision, get_model_conf, get_datamodule
 from vqvae.model import VQVAE
-from data.datamodules import ImageDataModule
 
 import argparse
 import math
 import os.path
 import wandb
-import yaml
 
 
 def parse_args():
@@ -43,76 +34,9 @@ def parse_args():
     parser.add_argument('--wandb_id', type=str,
                         help='wandb id of the run. Useful for resuming logging of a model', default=None)
     parser.add_argument('--workers', type=int, help='num of parallel workers', default=1)
+    parser.add_argument('--num_nodes', type=int, help='number of gpu nodes used for training', default=1)
 
     return parser.parse_args()
-
-
-def get_model_conf(filepath: str):
-    # load params
-    with open(filepath, 'r', encoding='utf-8') as stream:
-        params = yaml.safe_load(stream)
-
-    return params
-
-
-def get_datamodule(loader_type: str, dirpath: str, image_size: int, batch_size: int, workers: int, seed: int,
-                   is_dist: bool):
-    if not os.path.isdir(dirpath):
-        raise FileNotFoundError(f"dataset path not found: {dirpath}")
-
-    else:
-
-        if loader_type == 'standard':
-
-            train_folder = f'{dirpath}train/'
-            val_folder = f'{dirpath}validation/'
-            return ImageDataModule(image_size, batch_size, workers, train_folder, val_folder)
-
-        elif loader_type == 'ffcv':
-
-            train_manager = FFCVPipelineManager(
-                file_path=f'{dirpath}train.beton',
-                pipeline_transforms=[
-                    [
-                        CenterCropRGBImageDecoder((image_size, image_size), ratio=1),
-                        ToTensor(),
-                        ToTorchImage(),
-                        DivideImage255(dtype=torch.float16)
-                    ]
-                ],
-                ordering=OrderOption.RANDOM
-            )
-
-            val_manager = FFCVPipelineManager(
-                file_path=f'{dirpath}validation.beton',
-                pipeline_transforms=[
-                    [
-                        CenterCropRGBImageDecoder((image_size, image_size), ratio=1),
-                        ToTensor(),
-                        ToTorchImage(),
-                        DivideImage255(dtype=torch.float16)
-                    ]
-                ]
-            )
-
-            return FFCVDataModule(batch_size, workers, is_dist, train_manager, val_manager, seed=seed)
-
-        else:
-            raise ValueError(f"loader type not recognized: {loader_type}")
-
-
-def set_matmul_precision():
-    """
-    If using Ampere Gpus enable using tensor cores.
-    Don't know exactly which other devices can benefit from this, but torch should throw a warning in case.
-    Docs: https://pytorch.org/docs/stable/generated/torch.set_float32_matmul_precision.html
-    """
-
-    gpu_cores = os.popen('nvidia-smi -L').readlines()[0]
-
-    if 'A100' in gpu_cores:
-        torch.set_float32_matmul_precision('high')
-        print('[INFO] set matmul precision "high"')
 
 
 def main():
@@ -124,8 +48,8 @@ def main():
     conf = get_model_conf(args.params_file)
 
     # configuration params (assumes some env variables in case of multi-node setup)
-    num_nodes = int(os.getenv('NODES')) if os.getenv('NODES') is not None else 1
     gpus = torch.cuda.device_count()
+    num_nodes = args.num_nodes
     rank = int(os.getenv('NODE_RANK')) if os.getenv('NODE_RANK') is not None else 0
     is_dist = gpus > 1 or num_nodes > 1
 
@@ -174,7 +98,9 @@ def main():
               }
 
     # check if using adversarial loss
-    use_adversarial = l_conf is not None and 'adversarial_params' in l_conf.keys()
+    use_adversarial = (l_conf is not None
+                       and 'adversarial_params' in l_conf.keys()
+                       and l_conf['adversarial_params'] is not None)
 
     # get model
     if resume:
@@ -189,7 +115,7 @@ def main():
 
     # data loading (standard pytorch lightning or ffcv)
     datamodule = get_datamodule(args.dataloader, args.dataset_path, image_size, batch_size_per_device,
-                                workers, seed, is_dist)
+                                workers, seed, is_dist, mode='train')
 
     # callbacks
     checkpoint_callback = ModelCheckpoint(dirpath=save_checkpoint_dir, filename='{epoch:02d}', save_last=True,
@@ -199,7 +125,7 @@ def main():
 
     # trainer
     # set find unused parameters if using vqgan (adversarial training)
-    trainer = pl.Trainer(strategy=DDPStrategy(find_unused_parameters=use_adversarial, static_graph=True),
+    trainer = pl.Trainer(strategy=DDPStrategy(find_unused_parameters=use_adversarial, static_graph=not use_adversarial),
                          accelerator='gpu', num_nodes=num_nodes, devices=gpus, precision='16-mixed',
                          callbacks=callbacks, deterministic=True, logger=logger,
                          max_epochs=max_epochs, check_val_every_n_epoch=5)

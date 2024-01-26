@@ -9,14 +9,20 @@ import wandb
 
 from vqvae.modules.abstract_modules.base_autoencoder import BaseVQVAE
 from vqvae.modules.autoencoder import Encoder, Decoder
-from vqvae.modules.loss.loss import VQLPIPSWithDiscriminator
+from vqvae.modules.loss.loss import VQLPIPSWithDiscriminator, VQLPIPS
 from vqvae.modules.vector_quantizers import VectorQuantizer, EMAVectorQuantizer, GumbelVectorQuantizer, \
     EntropyVectorQuantizer
+
+from torchmetrics import MeanSquaredError
+from torchmetrics.image.fid import FrechetInceptionDistance
+from torchmetrics.image.ssim import StructuralSimilarityIndexMeasure
+from torchmetrics.image.psnr import PeakSignalNoiseRatio
+from torchvision.transforms import ConvertImageDtype
 
 
 class VQVAE(BaseVQVAE, pl.LightningModule):
 
-    def __init__(self, image_size: int, ae_conf: dict, q_conf: dict, l_conf: dict or None, t_conf: dict,
+    def __init__(self, image_size: int, ae_conf: dict, q_conf: dict, l_conf: dict or None, t_conf: dict or None,
                  init_cb: bool = True, load_loss: bool = True):
         """
         :param image_size: resolution of (squared) input images
@@ -35,8 +41,8 @@ class VQVAE(BaseVQVAE, pl.LightningModule):
                                 standard --> {commitment_cost: float}
                                 ema --> {commitment_cost: float, decay: float, epsilon: float}
                                 gumbel --> {straight_through: bool, temp: float, kl_cost: float,
-                                            kl_warmup_epochs: int or None,
-                                            temp_decay_epochs: int or None,
+                                            kl_warmup_epochs: float or None,
+                                            temp_decay_epochs: float or None,
                                             temp_final: float or None}
                                 entropy --> {ent_loss_ratio: float, ent_temperature: float,
                                              ent_loss_type: str = 'softmax' or 'argmax',
@@ -47,10 +53,11 @@ class VQVAE(BaseVQVAE, pl.LightningModule):
                           l1_weight: float --> weight for log_laplace loss
                           l2_weight: float --> weight for standard l2 loss
                           perc_weight: float --> weight for perceptual loss
-                          adversarial_params: dict
+                          adversarial_params: dict or None (if None, do not use Discriminator but only PLoss).
                               start_epoch: int --> suggestion is to wait at least one epoch.
                               loss_type: str = "hinge" or "non-saturating"
-                              adaptive_weight: float --> weight for generator loss, modulated according to gradients
+                              g_weight: float --> generator loss base weight
+                              use_adaptive: bool --> scale g_weight adaptively, according to last decoder layer
                               r1_reg_weight: float --> weight for R1 regularization of Discriminator
                               r1_reg_every: int --> R1 regularization to be applied every n steps
 
@@ -128,6 +135,9 @@ class VQVAE(BaseVQVAE, pl.LightningModule):
         if load_loss:
             if l_conf is None:
                 self.criterion = torch.nn.MSELoss()
+            elif l_conf['adversarial_params'] is None:
+                # use lpips without Discriminator (just for ablation)
+                self.criterion = VQLPIPS(l_conf['l1_weight'], l_conf['l2_weight'], l_conf['perc_weight'])
             else:
                 self.criterion = VQLPIPSWithDiscriminator(image_size, l_conf['l1_weight'], l_conf['l2_weight'],
                                                           l_conf['perc_weight'], l_conf['adversarial_params'])
@@ -162,32 +172,31 @@ class VQVAE(BaseVQVAE, pl.LightningModule):
             warmup_step_start = 0
             warmup_step_end = self.t_conf['warmup_epoch'] * self.trainer.num_training_batches
             decay_step_end = self.t_conf['decay_epoch'] * self.trainer.num_training_batches
-            self.warmup_then_decay_lr = LinearCosineScheduler(warmup_step_start, decay_step_end,
-                                                              lr, lr / 10, warmup_step_end)
+            self.scheduler = LinearCosineScheduler(warmup_step_start, decay_step_end, lr, lr / 10, warmup_step_end)
 
         elif self.t_conf['warmup_epochs'] is not None:
 
             warmup_step_start = 0
             warmup_step_end = self.t_conf['warmup_epochs'] * self.trainer.num_training_batches
-            self.warmup_lr = LinearScheduler(warmup_step_start, warmup_step_end, 1e-20, lr)
+            self.scheduler = LinearScheduler(warmup_step_start, warmup_step_end, 1e-20, lr)
 
         elif self.t_conf['decay_epochs'] is not None:
 
             decay_step_start = 0
             decay_step_end = self.t_conf['decay_epochs'] * self.trainer.num_training_batches
-            self.decay_lr = CosineScheduler(decay_step_start, decay_step_end, lr, lr / 10)
+            self.scheduler = CosineScheduler(decay_step_start, decay_step_end, lr, lr / 10)
 
         # if quantizer is gumbel
         if isinstance(self.quantizer, GumbelVectorQuantizer):
             temp, kl = self.quantizer.get_consts()
             if self.kl_warmup_epochs is not None:
                 kl_start = 0
-                kl_stop = self.kl_warmup_epochs * self.trainer.num_training_batches
-                self.quantizer.kl_warmup = LinearScheduler(kl_start, kl_stop, 0.0, kl)
+                kl_stop = int(self.kl_warmup_epochs * self.trainer.num_training_batches)
+                self.quantizer.kl_warmup = CosineScheduler(kl_start, kl_stop, 0.0, kl)
 
             if self.temp_decay_epochs is not None and self.temp_final is not None:
                 temp_start = 0
-                temp_stop = self.temp_decay_epochs * self.trainer.num_training_batches
+                temp_stop = int(self.temp_decay_epochs * self.trainer.num_training_batches)
                 self.quantizer.temp_decay = CosineScheduler(temp_start, temp_stop, temp, self.temp_final)
 
     def on_train_batch_start(self, _: Any, batch_index: int):
@@ -197,12 +206,8 @@ class VQVAE(BaseVQVAE, pl.LightningModule):
         current_step = (self.current_epoch * self.trainer.num_training_batches) + batch_index
 
         # lr update
-        if self.warmup_then_decay_lr is not None:
-            step_lr = self.warmup_then_decay_lr.step(current_step)
-        elif self.warmup_lr is not None:
-            step_lr = self.warmup_lr.step(current_step)
-        elif self.decay_lr is not None:
-            step_lr = self.decay_lr.step(current_step)
+        if self.scheduler is not None:
+            step_lr = self.scheduler.step(current_step)
         else:
             step_lr = self.t_conf['lr']
 
@@ -234,35 +239,40 @@ class VQVAE(BaseVQVAE, pl.LightningModule):
 
         # log reconstructions (every 5 epochs, for one batch)
         if batch_index == 2 and self.current_epoch % 5 == 0:
-            self.log_reconstructions(batch_index, images, x_recon, t_or_v='t')
+            self.log_reconstructions(images, x_recon, t_or_v='t')
 
         if isinstance(self.criterion, VQLPIPSWithDiscriminator):
             ae_opt, disc_opt = self.optimizers()
 
             # Autoencoder Optimization
+            ae_opt.zero_grad()
             res = self.criterion.forward_autoencoder(q_loss, images, x_recon, self.current_epoch,
                                                      last_layer=self.decoder.conv_out.weight)
-            loss, l1_loss, l2_loss, p_loss, g_loss, adaptive_weight = res
+            loss, l1_loss, l2_loss, p_loss, g_loss, g_weight = res
 
-            ae_opt.zero_grad()
             self.manual_backward(loss)
             ae_opt.step()
 
             # Discriminator Optimization
-            step = (self.current_epoch * self.trainer.num_training_batches) + batch_index
-            disc_loss, r1_penalty = self.criterion.forward_discriminator(images, x_recon, self.current_epoch, step)
-
             disc_opt.zero_grad()
-            self.manual_backward(disc_loss)
+            step = (self.current_epoch * self.trainer.num_training_batches) + batch_index
+            loss, d_loss, r1_penalty = self.criterion.forward_discriminator(images, x_recon, self.current_epoch, step)
+
+            self.manual_backward(loss)
             disc_opt.step()
+
+        elif isinstance(self.criterion, VQLPIPS):
+            loss, l1_loss, l2_loss, p_loss = self.criterion(q_loss, images, x_recon)
+            g_loss, d_loss = torch.zeros(1), torch.zeros(1)
+            g_weight, r1_penalty = 0., 0.
 
         else:
             l2_loss = self.criterion(x_recon, images)
-            l1_loss, g_loss, p_loss, disc_loss = torch.zeros(1), torch.zeros(1), torch.zeros(1), torch.zeros(1)
-            adaptive_weight, r1_penalty = 0., 0.
+            l1_loss, g_loss, p_loss, d_loss = torch.zeros(1), torch.zeros(1), torch.zeros(1), torch.zeros(1)
+            g_weight, r1_penalty = 0., 0.
             loss = q_loss + l2_loss
 
-        self.log('adaptive_weight', adaptive_weight, sync_dist=True, on_step=False, on_epoch=True)
+        self.log('g_weight', g_weight, sync_dist=True, on_step=False, on_epoch=True)
         self.log('r1_penalty', r1_penalty, sync_dist=True, on_step=False, on_epoch=True)
 
         self.log('train/loss', loss.detach().cpu().item(), sync_dist=True, on_step=False, on_epoch=True)
@@ -271,7 +281,7 @@ class VQVAE(BaseVQVAE, pl.LightningModule):
         self.log('train/quant_loss', q_loss.detach().cpu().item(), sync_dist=True, on_step=False, on_epoch=True)
         self.log('train/perc_loss', p_loss.detach().cpu().item(), sync_dist=True, on_step=False, on_epoch=True)
         self.log('train/gen_loss', g_loss.detach().cpu().item(), sync_dist=True, on_step=False, on_epoch=True)
-        self.log('train/disc_loss', disc_loss.detach().cpu().item(), sync_dist=True, on_step=False, on_epoch=True)
+        self.log('train/disc_loss', d_loss.detach().cpu().item(), sync_dist=True, on_step=False, on_epoch=True)
 
         # batch index count (use non-deterministic for this operation)
         torch.use_deterministic_algorithms(False)
@@ -301,7 +311,7 @@ class VQVAE(BaseVQVAE, pl.LightningModule):
 
         # log reconstructions (validation is done every 5 epochs by default)
         if batch_index == 2:
-            self.log_reconstructions(batch_index, images, x_recon, t_or_v='v')
+            self.log_reconstructions(images, x_recon, t_or_v='v')
 
         if isinstance(self.criterion, VQLPIPSWithDiscriminator):
 
@@ -312,11 +322,15 @@ class VQVAE(BaseVQVAE, pl.LightningModule):
 
             # Discriminator part
             step = (self.current_epoch * self.trainer.num_training_batches) + batch_index
-            disc_loss, _ = self.criterion.forward_discriminator(images, x_recon, self.current_epoch, step)
+            _, d_loss, _ = self.criterion.forward_discriminator(images, x_recon, self.current_epoch, step)
+
+        elif isinstance(self.criterion, VQLPIPS):
+            loss, l1_loss, l2_loss, p_loss = self.criterion(q_loss, images, x_recon)
+            g_loss, d_loss = torch.zeros(1), torch.zeros(1)
 
         else:
             l2_loss = self.criterion(x_recon, images)
-            l1_loss, g_loss, p_loss, disc_loss = torch.zeros(1), torch.zeros(1), torch.zeros(1), torch.zeros(1)
+            l1_loss, g_loss, p_loss, d_loss = torch.zeros(1), torch.zeros(1), torch.zeros(1), torch.zeros(1)
             loss = q_loss + l2_loss
 
         self.log('validation/loss', loss.cpu().item(), sync_dist=True, on_step=False, on_epoch=True)
@@ -325,7 +339,7 @@ class VQVAE(BaseVQVAE, pl.LightningModule):
         self.log('validation/quant_loss', q_loss.cpu().item(), sync_dist=True, on_step=False, on_epoch=True)
         self.log('validation/perc_loss', p_loss.cpu().item(), sync_dist=True, on_step=False, on_epoch=True)
         self.log('validation/gen_loss', g_loss.cpu().item(), sync_dist=True, on_step=False, on_epoch=True)
-        self.log('validation/disc_loss', disc_loss.cpu().item(), sync_dist=True, on_step=False, on_epoch=True)
+        self.log('validation/disc_loss', d_loss.cpu().item(), sync_dist=True, on_step=False, on_epoch=True)
 
         # batch index count (use non-deterministic for this operation)
         torch.use_deterministic_algorithms(False)
@@ -348,6 +362,10 @@ class VQVAE(BaseVQVAE, pl.LightningModule):
         self.val_epoch_usage_count = None
 
         return
+
+    def on_train_end(self):
+        # ensure to destroy c++ scheduler object
+        self.scheduler.destroy()
 
     def configure_optimizers(self):
         def split_decay_groups(named_modules: list, named_parameters: list,
@@ -421,7 +439,7 @@ class VQVAE(BaseVQVAE, pl.LightningModule):
         return ae_optimizer
 
     @torch.no_grad()
-    def log_reconstructions(self, batch_index, ground_truths, reconstructions, t_or_v='t'):
+    def log_reconstructions(self, ground_truths, reconstructions, t_or_v='t'):
         """
         log reconstructions
         """
@@ -438,29 +456,106 @@ class VQVAE(BaseVQVAE, pl.LightningModule):
 
     def get_tokens(self, images: torch.Tensor) -> torch.IntTensor:
         """
-        :param images: B, 3, H, W
+        :param images: B, 3, H, W in range 0__1
         :return B, S batch of codebook indices
         """
 
+        images = self.preprocess_batch(images)
         return self.quantizer.vec_to_codes(self.encoder(images))
 
     def quantize(self, images: torch.Tensor) -> torch.Tensor:
         """
-        :param images: B, 3, H, W
+        :param images: B, 3, H, W in range 0__1
         :return B, S, D batch of quantized
         """
+        images = self.preprocess_batch(images)
         return rearrange(self.quantizer(self.encoder(images))[0], 'b d h w -> b (h w) d')
 
     def reconstruct(self, images: torch.Tensor) -> torch.Tensor:
         """
-        :param images: B, 3, H, W
-        :return reconstructions (B, 3, H, W)
+        :param images: B, 3, H, W in range 0__1
+        :return reconstructions (B, 3, H, W)  in range 0__1
         """
-        return self(images)[0]
+
+        images = self.preprocess_batch(images)
+        return self.preprocess_visualization(self(images)[0])
 
     def reconstruct_from_tokens(self, tokens: torch.IntTensor) -> torch.Tensor:
         """
         :param tokens: B, S where S is the sequence len
-        :return (B, 3, H, W) reconstructed images
+        :return (B, 3, H, W) reconstructed images in range 0__1
         """
-        return self.decoder(self.quantizer.codes_to_vec(tokens))
+        return self.preprocess_visualization(self.decoder(self.quantizer.codes_to_vec(tokens)))
+
+    def on_test_epoch_start(self):
+
+        # metrics for testing
+        self.test_mse = MeanSquaredError().to('cuda')
+        self.test_ssim = StructuralSimilarityIndexMeasure().to('cuda')
+        self.test_psnr = PeakSignalNoiseRatio().to('cuda')
+        self.test_rfid = FrechetInceptionDistance().to('cuda')
+
+        # test used codebook, perplexity
+        self.test_usage_count = None
+
+    def test_step(self, images, _):
+
+        # get reconstructions, used_indices
+        images = images[0] if isinstance(images, tuple) else images
+        reconstructions, _, used_indices = self.forward(self.preprocess_batch(images))
+        reconstructions = self.preprocess_visualization(reconstructions)
+
+        # batch index count (use non-deterministic for this operation)
+        torch.use_deterministic_algorithms(False)
+        used_indices = torch.bincount(used_indices.view(-1), minlength=self.cb_size)
+        torch.use_deterministic_algorithms(True)
+
+        self.test_usage_count = used_indices if self.test_usage_count is None else + used_indices
+
+        # plot reconstruction (just for sanity check)
+        # import matplotlib.pyplot as plt
+        # import numpy as np
+        # fig, ax = plt.subplots(1, 2)
+        # ax[0].imshow(np.float32(images[0].permute(1, 2, 0).cpu().numpy()))
+        # ax[1].imshow(np.float32(reconstructions[0].permute(1, 2, 0).cpu().numpy()))
+        # plt.show()
+
+        # computed Metrics:
+
+        # MSE
+        self.test_mse.update(reconstructions, images)
+
+        # SSIM
+        self.test_ssim.update(reconstructions, images)
+
+        # PSNR
+        self.test_psnr.update(reconstructions, images)
+
+        # rFID take uint 8
+        conv = ConvertImageDtype(torch.uint8)
+        reconstructions = conv(reconstructions)
+        images = conv(images)
+
+        # rFID
+        self.test_rfid.update(reconstructions, real=False)
+        self.test_rfid.update(images, real=True)
+
+    def on_test_epoch_end(self):
+
+        total_mse = self.test_mse.compute()
+        self.log(f"mse", total_mse)
+
+        total_ssim = self.test_ssim.compute()
+        self.log(f"ssim", total_ssim)
+
+        total_psnr = self.test_psnr.compute()
+        self.log(f"psnr", total_psnr)
+
+        total_fid = self.test_rfid.compute()
+        self.log(f"rfid", total_fid)
+
+        _, perplexity, cb_usage = self.quantizer.get_codebook_usage(self.test_usage_count)
+
+        # log results
+        self.log(f"used_codebook", cb_usage)
+        self.log(f"perplexity", perplexity)
